@@ -1,0 +1,138 @@
+import {
+  ConnectedAccountListResponse as RawConnectedAccountListResponse,
+  ConnectedAccountRetrieveResponse as RawConnectedAccountRetrieveResponse,
+  type ConnectedAccountCompleteAuthResponse as RawConnectedAccountCompleteAuthResponse,
+  type ConnectedAccountRevokeResponse as RawConnectedAccountRevokeResponse,
+} from '@composio/client/resources/connected-accounts';
+import {
+  ConnectedAccountListResponse,
+  ConnectedAccountListResponseSchema,
+  ConnectedAccountRetrieveResponse,
+  ConnectedAccountRetrieveResponseSchema,
+  ConnectedAccountRevokeResponse,
+  ConnectedAccountRevokeResponseSchema,
+  ConnectedAccountCompleteAuthResponse,
+  ConnectedAccountCompleteAuthResponseSchema,
+} from '../../types/connectedAccounts.types';
+import { ConnectionDataSchema } from '../../types/connectedAccountAuthStates.types';
+import logger from '../logger';
+import { transform } from '../transform';
+
+/**
+ * Transforms the raw connected account response from the Composio API to the SDK format.
+ *
+ * This method converts property names from snake_case to camelCase and reorganizes
+ * the data structure to match the SDK's standardized format.
+ *
+ * @param {RawConnectedAccountListResponse['items'][0]|RawConnectedAccountRetrieveResponse} response - The raw API response to transform
+ * @returns {Promise<ConnectedAccountRetrieveResponse>} The transformed response
+ * @throws {ZodError} If the response fails validation against the expected schema
+ *
+ * @private
+ */
+export function transformConnectedAccountResponse(
+  response: RawConnectedAccountRetrieveResponse | RawConnectedAccountListResponse['items'][0]
+): ConnectedAccountRetrieveResponse {
+  // Safely parse the state field, filtering out unsupported auth schemes
+  const parseState = (state: unknown) => {
+    try {
+      return state ? ConnectionDataSchema.parse(state) : undefined;
+    } catch (error) {
+      logger.warn('Unsupported auth scheme in connected account state, ignoring state field', {
+        error,
+      });
+      return undefined;
+    }
+  };
+
+  return transform(response)
+    .with(ConnectedAccountRetrieveResponseSchema)
+    .using(response => ({
+      ...response,
+      authConfig: {
+        ...response.auth_config,
+        id: response.auth_config.id,
+        authScheme: response.auth_config.auth_scheme,
+        isComposioManaged: response.auth_config.is_composio_managed,
+        isDisabled: response.auth_config.is_disabled,
+      },
+      wordId: response.word_id ?? null,
+      alias: response.alias ?? null,
+      data: response.data ?? undefined,
+      state: parseState(response.state),
+      status: response.status,
+      statusReason: response.status_reason,
+      isDisabled: response.is_disabled,
+      createdAt: response.created_at,
+      updatedAt: response.updated_at,
+      testRequestEndpoint: response.test_request_endpoint,
+      // Experimental — shape may change in future releases. Pass the
+      // nested `experimental` block straight through; the inner
+      // `aclConfigForShared` is conditionally visible (absent when the
+      // caller isn't authorised to see the ACL), so distinguish "I can't
+      // see the ACL" from "ACL is the default deny-by-default state" by
+      // checking field presence.
+      experimental: response.experimental
+        ? {
+            accountType: response.experimental.account_type,
+            aclConfigForShared: response.experimental.acl_config_for_shared
+              ? {
+                  allowAllUsers: response.experimental.acl_config_for_shared.allow_all_users,
+                  allowedUserIds: response.experimental.acl_config_for_shared.allowed_user_ids,
+                  notAllowedUserIds:
+                    response.experimental.acl_config_for_shared.not_allowed_user_ids,
+                }
+              : undefined,
+          }
+        : undefined,
+    }));
+}
+
+/**
+ * Transforms the raw connected account list response from the Composio API to the SDK format.
+ *
+ * This method converts property names from snake_case to camelCase and reorganizes
+ * the data structure to match the SDK's standardized format.
+ *
+ * @param {RawConnectedAccountListResponse} response - The raw API response to transform
+ * @returns {ConnectedAccountListResponse} The transformed response
+ * @throws {ZodError} If the response fails validation against the expected schema
+ *
+ * @private
+ */
+export function transformConnectedAccountListResponse(
+  response: RawConnectedAccountListResponse
+): ConnectedAccountListResponse {
+  return transform(response)
+    .with(ConnectedAccountListResponseSchema)
+    .using(response => ({
+      items: response.items.map(transformConnectedAccountResponse),
+      nextCursor: response.next_cursor ?? null,
+      totalPages: response.total_pages,
+    }));
+}
+
+export const transformConnectedAccountRevokeResponse = (
+  response: RawConnectedAccountRevokeResponse
+): ConnectedAccountRevokeResponse => {
+  return transform(response)
+    .with(ConnectedAccountRevokeResponseSchema)
+    .using(response => ({
+      revokedTokens: response.revoked_tokens,
+      connectedAccount: {
+        id: response.connected_account.id,
+        status: response.connected_account.status,
+      },
+    }));
+};
+
+export const transformConnectedAccountCompleteAuthResponse = (
+  response: RawConnectedAccountCompleteAuthResponse
+): ConnectedAccountCompleteAuthResponse => {
+  return transform(response)
+    .with(ConnectedAccountCompleteAuthResponseSchema)
+    .using(response => ({
+      connectedAccountId: response.connected_account_id,
+      toolkitSlug: response.toolkit_slug,
+    }));
+};

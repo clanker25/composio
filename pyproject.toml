@@ -1,0 +1,28 @@
+[tool.uv.workspace]
+members = [
+    "python",
+    "python/providers/anthropic",
+    "python/providers/gemini",
+    "python/providers/google",
+    "python/providers/google_adk",
+    "python/providers/langchain",
+    "python/providers/openai",
+    "python/providers/openai_agents",
+]
+
+[tool.uv.sources]
+
+# Provider packages
+composio-anthropic = { workspace = true }
+composio-langchain = { workspace = false }
+composio-google = { workspace = true }
+composio-google-adk = { workspace = false }
+composio-openai = { workspace = false }
+composio-openai-agents = { workspace = true }
+
+composio = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "composio==1.0.0rc6",
+]

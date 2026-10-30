@@ -1,0 +1,426 @@
+import * as FileSystem from 'effect/FileSystem';
+import * as Path from 'effect/Path';
+import * as BunFileSystem from '@effect/platform-bun/BunFileSystem';
+import { Context, Data, Effect, Layer, Option, Predicate, Schema } from 'effect';
+import semver from 'semver';
+import { bold, cyanBright, dim } from 'src/ui/colors';
+import { GITHUB_CONFIG } from 'src/config';
+import { captureServices } from 'src/effects/capture-services';
+import { APP_VERSION } from '../constants';
+import type { InvocationHookShape } from './invocation-hook';
+import { NodeOs, type NodeOsShape } from './node-os';
+import { resolveRunningCliVersion } from './run-companion-modules';
+import { TerminalUI } from './terminal-ui';
+
+/**
+ * Background update check for @composio/cli.
+ *
+ * Two invocation hooks, both run for the selected command before its handler — they must never
+ * block or fail. A command opts out of either in its `CommandMeta` (`src/commands/index.ts`):
+ *
+ *   UpdateNotice             — reads a tiny cached JSON file (~1 ms)
+ *   BackgroundUpdateCheck    — fire-and-forget fetch, no await
+ *
+ * Strategy:
+ *   Uses GitHub's releases API and only considers stable @composio/cli releases
+ *   that include the binary asset for the current platform. The result is cached
+ *   to ~/.composio/update-check.json and refreshed at most once every 24 hours.
+ */
+
+const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+/** Matches `@composio/cli@<semver>` — excludes prereleases. */
+const CLI_RELEASE_TAG_RE = /^@composio\/cli@(\d+\.\d+\.\d+)$/;
+
+export interface UpdateCheckState {
+  lastChecked: string; // ISO-8601
+  latestVersion: string; // e.g. "0.3.0"
+}
+
+/** Machine-readable update status for `composio version --check`. */
+export interface UpdateStatus {
+  /** Version reported by the running CLI executable. */
+  current: string;
+  /** Latest known stable release with a binary for this platform, if known. */
+  latestStable: string | null;
+  /** True when a strictly newer stable release than `current` is available. */
+  updateAvailable: boolean;
+  /** Whether the latest known state is current, actionable, or unavailable. */
+  checkStatus: 'up-to-date' | 'update-available' | 'unknown';
+  /** When the release list was last fetched (ISO-8601), if ever. */
+  lastChecked: string | null;
+}
+
+const toCheckStatus = (params: {
+  readonly updateAvailable: boolean;
+  readonly versionsKnown: boolean;
+}): UpdateStatus['checkStatus'] => {
+  if (params.updateAvailable) return 'update-available';
+  if (!params.versionsKnown) return 'unknown';
+  return 'up-to-date';
+};
+
+const UpdateCheckStateSchema = Schema.fromJsonString(
+  Schema.Struct({
+    lastChecked: Schema.String,
+    latestVersion: Schema.String,
+  })
+);
+
+const UpdateCheckAttemptSchema = Schema.fromJsonString(
+  Schema.Struct({
+    lastAttempted: Schema.String,
+  })
+);
+
+/** Non-2xx GitHub response; recorded as a failed attempt and otherwise swallowed. */
+class UpdateCheckHttpError extends Data.TaggedError('UpdateCheckHttpError')<{
+  readonly status: number;
+}> {}
+
+// ── Injectable configuration ────────────────────────────────────────────
+
+/** Dependencies injected into the update checker — mirrors the Effect service pattern. */
+export interface UpdateCheckConfig {
+  readonly stateFile: string;
+  readonly currentVersion: string;
+  readonly checkIntervalMs: number;
+  readonly releasesUrl: string;
+  readonly binaryAssetName: string | undefined;
+  readonly accessToken: string | undefined;
+  readonly fetchFn: (url: string, init?: RequestInit) => Promise<Response>;
+}
+
+const defaultStateFile = Effect.gen(function* () {
+  const path = yield* Path.Path;
+  const os = yield* NodeOs;
+  return path.join(os.homedir, '.composio', 'update-check.json');
+});
+
+function getCurrentBinaryAssetName(os: Pick<NodeOsShape, 'platform' | 'arch'>): string | undefined {
+  const { platform } = os;
+  const rawArch: string = os.arch;
+  if (platform !== 'darwin' && platform !== 'linux') return undefined;
+
+  const arch = rawArch === 'arm64' || rawArch === 'aarch64' ? 'aarch64' : rawArch;
+  if (arch !== 'x64' && arch !== 'aarch64') return undefined;
+
+  return `composio-${platform}-${arch}.zip`;
+}
+
+const defaultConfig = (stateFile: string) =>
+  Effect.gen(function* () {
+    const os = yield* NodeOs;
+    const currentVersion = yield* resolveRunningCliVersion(process.execPath, APP_VERSION);
+    const github = yield* Effect.orDie(GITHUB_CONFIG);
+    return {
+      stateFile,
+      currentVersion,
+      checkIntervalMs: CHECK_INTERVAL_MS,
+      releasesUrl: `${github.apiBaseUrl}/repos/${github.owner}/${github.repo}/releases?per_page=100`,
+      binaryAssetName: getCurrentBinaryAssetName(os),
+      accessToken: github.accessToken,
+      fetchFn: fetch,
+    } satisfies UpdateCheckConfig;
+  });
+
+const attemptFileFor = (stateFile: string) => `${stateFile}.attempt`;
+
+const writeJsonFile = (file: string, value: unknown) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    yield* fs.makeDirectory(path.dirname(file), { recursive: true });
+    yield* fs.writeFileString(file, JSON.stringify(value, null, 2));
+  });
+
+/** Persist a successful check and clear any failed-attempt marker it supersedes. */
+const writeState = (stateFile: string, state: UpdateCheckState) =>
+  writeJsonFile(stateFile, state).pipe(
+    Effect.andThen(
+      Effect.flatMap(FileSystem.FileSystem, fs =>
+        fs.remove(attemptFileFor(stateFile), { force: true })
+      )
+    )
+  );
+
+// ── Pure helpers ────────────────────────────────────────────────────────
+
+/** Extract the highest stable semver from GitHub releases that include the required binary. */
+export function parseLatestVersionFromReleases(
+  releases: unknown,
+  binaryAssetName: string | undefined
+): string | undefined {
+  if (!binaryAssetName || !Array.isArray(releases)) return undefined;
+
+  let latest: string | undefined;
+  for (const release of releases) {
+    if (!Predicate.isObject(release)) continue;
+
+    const candidate = release;
+    if (typeof candidate.tag_name !== 'string') continue;
+    if (candidate.prerelease === true || candidate.draft === true) continue;
+    if (!Array.isArray(candidate.assets)) continue;
+
+    const hasRequiredBinary = candidate.assets.some(
+      asset => Predicate.hasProperty(asset, 'name') && asset.name === binaryAssetName
+    );
+    if (!hasRequiredBinary) continue;
+
+    const match = CLI_RELEASE_TAG_RE.exec(candidate.tag_name);
+    if (!match) continue;
+
+    const version = match[1];
+    if (!latest || semver.gt(version, latest)) {
+      latest = version;
+    }
+  }
+
+  return latest;
+}
+
+// ── Factory ─────────────────────────────────────────────────────────────
+
+export function createUpdateChecker(config: UpdateCheckConfig) {
+  const attemptFile = attemptFileFor(config.stateFile);
+
+  const readState = Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const rawState = yield* fs.readFileString(config.stateFile);
+    return yield* Schema.decodeUnknownEffect(UpdateCheckStateSchema)(rawState);
+  });
+
+  const readAttempt = Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const rawAttempt = yield* fs.readFileString(attemptFile);
+    return yield* Schema.decodeUnknownEffect(UpdateCheckAttemptSchema)(rawAttempt);
+  });
+
+  /**
+   * If a cached newer version is known, print a one-line hint to stderr.
+   * Reads a tiny JSON file and does a semver compare.
+   */
+  function showUpdateNotice(terminal: Pick<TerminalUI, 'capabilities' | 'error'>) {
+    return Effect.gen(function* () {
+      // `terminal.error` writes even when stderr is redirected, so gate this
+      // advisory notice explicitly while leaving stdout out of the decision.
+      const { canDecorate } = yield* terminal.capabilities;
+      if (!canDecorate) return;
+
+      const state = yield* readState;
+      const latestVersion = semver.valid(state.latestVersion);
+      const currentVersion = semver.valid(config.currentVersion);
+      if (!latestVersion || !currentVersion || latestVersion === currentVersion) return;
+
+      // Only show when the cached version is strictly newer.
+      if (!semver.gt(latestVersion, currentVersion)) return;
+
+      const msg =
+        `  ${dim('Update available:')} ${dim(config.currentVersion)} ${dim('→')} ${bold(cyanBright(latestVersion))}\n` +
+        `  ${dim('Run')} ${cyanBright('composio upgrade')} ${dim('to update')}\n`;
+
+      yield* terminal.error(`\n${msg}`);
+    }).pipe(Effect.ignore);
+  }
+
+  /**
+   * Fetch the latest @composio/cli release from GitHub, requiring the current
+   * platform binary asset before writing the result to the state file.
+   *
+   * Never fails: every fetch/parse/write error is swallowed so nothing can
+   * propagate back into the fire-and-forget caller.
+   */
+  const checkForUpdate = Effect.gen(function* () {
+    const checkStartedAt = new Date();
+    const checkStartedAtMs = checkStartedAt.getTime();
+    const parseTimestamp = (value: string): number | undefined => {
+      const timestamp = new Date(value).getTime();
+      return Number.isFinite(timestamp) ? timestamp : undefined;
+    };
+
+    // Throttle: skip if checked recently. A missing or corrupt state file
+    // just means "re-check".
+    const cachedState = yield* Effect.option(readState);
+    const lastCheckedAt = Option.getOrUndefined(
+      Option.map(cachedState, state => parseTimestamp(state.lastChecked))
+    );
+    if (lastCheckedAt !== undefined && checkStartedAtMs - lastCheckedAt < config.checkIntervalMs) {
+      return { state: cachedState, refreshFailed: false } as const;
+    }
+    const failedAttempt = yield* Effect.option(readAttempt);
+    const lastAttemptedAt = Option.getOrUndefined(
+      Option.map(failedAttempt, attempt => parseTimestamp(attempt.lastAttempted))
+    );
+    if (
+      lastAttemptedAt !== undefined &&
+      (lastCheckedAt === undefined || lastAttemptedAt > lastCheckedAt) &&
+      checkStartedAtMs - lastAttemptedAt < config.checkIntervalMs
+    ) {
+      return { state: cachedState, refreshFailed: true } as const;
+    }
+    const previousLatestVersion = Option.getOrUndefined(
+      Option.map(cachedState, state => state.latestVersion)
+    );
+
+    const headers: Record<string, string> = {
+      Accept: 'application/vnd.github.v3+json',
+      'User-Agent': `composio-cli/${config.currentVersion}`,
+    };
+
+    if (config.accessToken) {
+      headers.Authorization = `Bearer ${config.accessToken}`;
+    }
+
+    const fetchLatestVersion = Effect.gen(function* () {
+      const response = yield* Effect.tryPromise(() =>
+        config.fetchFn(config.releasesUrl, { headers, signal: AbortSignal.timeout(10_000) })
+      );
+      if (!response.ok) {
+        return yield* new UpdateCheckHttpError({ status: response.status });
+      }
+      const releases: unknown = yield* Effect.tryPromise(() => response.json());
+      return parseLatestVersionFromReleases(releases, config.binaryAssetName);
+    });
+
+    const latestVersion = yield* Effect.option(fetchLatestVersion);
+    if (Option.isNone(latestVersion)) {
+      yield* Effect.ignore(
+        writeJsonFile(attemptFile, {
+          lastAttempted: checkStartedAt.toISOString(),
+        })
+      );
+      return { state: cachedState, refreshFailed: true } as const;
+    }
+
+    const state: UpdateCheckState = {
+      lastChecked: new Date().toISOString(),
+      latestVersion: latestVersion.value ?? previousLatestVersion ?? config.currentVersion,
+    };
+    yield* writeState(config.stateFile, state).pipe(Effect.ignore);
+    return { state: Option.some(state), refreshFailed: false } as const;
+  });
+
+  /**
+   * Refresh the release cache (self-throttled to the check interval) and
+   * report a machine-readable status. Unlike the notice, this ignores the
+   * TTY gate — callers asked for the data explicitly.
+   */
+  const getUpdateStatus: Effect.Effect<UpdateStatus, never, FileSystem.FileSystem | Path.Path> =
+    Effect.gen(function* () {
+      const { state, refreshFailed } = yield* checkForUpdate;
+
+      const cachedLatest = Option.getOrUndefined(Option.map(state, s => s.latestVersion));
+      const validLatest = cachedLatest ? semver.valid(cachedLatest) : null;
+      const validCurrent = semver.valid(config.currentVersion);
+      const latestStable =
+        validLatest && semver.prerelease(validLatest) === null ? validLatest : null;
+      const updateAvailable =
+        validCurrent !== null && latestStable !== null && semver.gt(latestStable, validCurrent);
+      const versionsKnown = !refreshFailed && validCurrent !== null && latestStable !== null;
+      const checkStatus = toCheckStatus({ updateAvailable, versionsKnown });
+
+      return {
+        current: config.currentVersion,
+        latestStable,
+        updateAvailable,
+        checkStatus,
+        lastChecked: Option.getOrElse(
+          Option.map(state, s => s.lastChecked),
+          () => null as string | null
+        ),
+      } satisfies UpdateStatus;
+    });
+
+  return { showUpdateNotice, checkForUpdate, getUpdateStatus };
+}
+
+// ── Public API (production defaults, fire-and-forget) ───────────────────
+
+const DefaultConfigLayers = Layer.mergeAll(Path.layer, NodeOs.Default, BunFileSystem.layer);
+
+export type UpdateNoticeShape = InvocationHookShape;
+
+/**
+ * Prints the upgrade hint to stderr if a newer version is cached. Reads the cache under the home
+ * directory `NodeOs` reports; never fetches. `composio upgrade` turns it off: it resolves the
+ * latest release live, so a cached hint could only repeat that answer or contradict it.
+ */
+export class UpdateNotice extends Context.Service<UpdateNotice, UpdateNoticeShape>()(
+  'services/UpdateNotice'
+) {
+  static readonly Default: Layer.Layer<
+    UpdateNotice,
+    never,
+    TerminalUI | FileSystem.FileSystem | Path.Path | NodeOs
+  > = Layer.effect(
+    UpdateNotice,
+    Effect.gen(function* () {
+      const terminal = yield* TerminalUI;
+      const services = yield* captureServices(FileSystem.FileSystem, Path.Path, NodeOs);
+      return UpdateNotice.of({
+        run: () =>
+          Effect.gen(function* () {
+            const stateFile = yield* defaultStateFile;
+            const config = yield* defaultConfig(stateFile);
+            yield* createUpdateChecker(config).showUpdateNotice(terminal);
+          }).pipe(Effect.provideContext(services)),
+      });
+    })
+  );
+}
+
+/**
+ * Refreshes the release cache from GitHub if it is stale; `checkForUpdate` swallows its own
+ * failures. `BackgroundUpdateCheck` forks it detached, so the command that started it neither
+ * waits for it nor interrupts it when it ends. A successful run still ends when the event loop
+ * drains (`src/run-main.ts`), so the request can finish; any other exit ends the process at once.
+ */
+const refreshReleaseCache = Effect.gen(function* () {
+  const stateFile = yield* defaultStateFile;
+  const config = yield* defaultConfig(stateFile);
+  yield* createUpdateChecker(config).checkForUpdate;
+}).pipe(Effect.provide(DefaultConfigLayers));
+
+export type BackgroundUpdateCheckShape = InvocationHookShape;
+
+/**
+ * Starts refreshing the release cache in the background (at most once per check interval) and
+ * returns at once. `composio upgrade` and `composio version --check` turn it off: they resolve
+ * releases themselves.
+ */
+export class BackgroundUpdateCheck extends Context.Service<
+  BackgroundUpdateCheck,
+  BackgroundUpdateCheckShape
+>()('services/BackgroundUpdateCheck') {
+  static readonly Default: Layer.Layer<BackgroundUpdateCheck> = Layer.succeed(
+    BackgroundUpdateCheck,
+    BackgroundUpdateCheck.of({ run: () => Effect.asVoid(Effect.forkDetach(refreshReleaseCache)) })
+  );
+}
+
+/**
+ * Record a live-resolved latest stable release (e.g. `@composio/cli@0.5.0`) as the cached update
+ * check, so later hints agree with what `composio upgrade` just saw. Tags that are not a stable
+ * CLI release are ignored, and a failed write is swallowed: the cache is advisory.
+ */
+export const recordLatestStableRelease = (releaseTag: string) =>
+  Option.fromNullishOr(CLI_RELEASE_TAG_RE.exec(releaseTag)?.[1]).pipe(
+    Option.match({
+      onNone: () => Effect.void,
+      onSome: latestVersion =>
+        Effect.gen(function* () {
+          const stateFile = yield* defaultStateFile;
+          yield* writeState(stateFile, { lastChecked: new Date().toISOString(), latestVersion });
+        }).pipe(Effect.ignore),
+    })
+  );
+
+/**
+ * Refresh the release cache if stale and return a machine-readable status.
+ * Powers `composio version --check`.
+ */
+export const getUpdateStatus: Effect.Effect<UpdateStatus> = Effect.gen(function* () {
+  const stateFile = yield* defaultStateFile;
+  const config = yield* defaultConfig(stateFile);
+  return yield* createUpdateChecker(config).getUpdateStatus;
+}).pipe(Effect.provide(DefaultConfigLayers));
