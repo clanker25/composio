@@ -1,0 +1,290 @@
+import { z } from 'zod/v3';
+import type { z as z4 } from 'zod/v4';
+import type {
+  SessionProxyExecuteParams,
+  ToolRouterSessionExecuteResponse,
+  ToolRouterSessionProxyExecuteResponse,
+} from './toolRouter.types';
+import type {
+  SessionCreateParams,
+  SessionCreateResponse,
+} from '@composio/client/resources/tool-router/session';
+
+export type AnyZodSchema = z.ZodType | z4.ZodType;
+export type InferZodSchema<T extends AnyZodSchema> = T extends z.ZodType
+  ? z.infer<T>
+  : T extends z4.ZodType
+    ? z4.infer<T>
+    : never;
+
+// ────────────────────────────────────────────────────────────────
+// New custom tool types (for tool router integration via createCustomTool())
+// ────────────────────────────────────────────────────────────────
+
+/**
+ * Session context injected into custom tool execute functions at runtime.
+ * Provides identity context and methods to call other tools or proxy API requests.
+ */
+export interface SessionContext {
+  /** The user ID for this session */
+  readonly userId: string;
+  /** Execute any Composio native tool from within a custom tool. Returns the same shape as session.execute(). */
+  execute(
+    toolSlug: string,
+    arguments_: Record<string, unknown>
+  ): Promise<ToolRouterSessionExecuteResponse>;
+  /** Proxy API calls through Composio's auth layer (resolved from session toolkit). */
+  proxyExecute(params: SessionProxyExecuteParams): Promise<ToolRouterSessionProxyExecuteResponse>;
+  /**
+   * Caller-supplied AbortSignal forwarded from `session.execute(..., { signal })`.
+   * Custom-tool execution is cooperative: long-running user code that respects
+   * this signal (e.g. by passing it into `fetch`) can abort mid-execution and
+   * surface as `ComposioRequestCancelledError`. Undefined when the caller did
+   * not pass `requestOptions`.
+   */
+  readonly signal?: AbortSignal;
+}
+
+/**
+ * Execute function for local tools.
+ * Just return the result data, or throw an error. The SDK wraps it internally.
+ *
+ * Supports two call patterns:
+ * - `(input) => data` — for tools that don't need session context
+ * - `(input, ctx) => data` — for tools that need to call other tools or proxy APIs
+ */
+export type LocalToolExecuteFn<T extends AnyZodSchema> = (
+  input: InferZodSchema<T>,
+  ctx: SessionContext
+) => Promise<Record<string, unknown>>;
+
+/** @deprecated Use `LocalToolExecuteFn` instead; local tools were previously called custom tools. */
+export type CustomToolExecuteFn<T extends AnyZodSchema> = LocalToolExecuteFn<T>;
+
+/**
+ * Zod schema for validating a custom tool slug.
+ * Alphanumeric, underscores, and hyphens only. No `LOCAL_` or `COMPOSIO_` prefix.
+ * Length is validated contextually (standalone vs extension vs toolkit) at creation time.
+ */
+export const CustomToolSlugSchema = z
+  .string()
+  .min(1, 'slug is required')
+  .regex(
+    /^[A-Za-z0-9_-]+$/,
+    'slug must only contain alphanumeric characters, underscores, and hyphens'
+  )
+  .refine(s => !s.toUpperCase().startsWith('LOCAL_'), {
+    message: 'slug must not start with "LOCAL_" — this prefix is reserved for internal routing.',
+  })
+  .refine(s => !s.toUpperCase().startsWith('COMPOSIO_'), {
+    message:
+      'slug must not start with "COMPOSIO_" — this prefix is reserved for Composio meta tools.',
+  });
+
+/**
+ * Zod schema for validating the string/scalar fields of createCustomTool() options.
+ * Slug is validated separately as the first argument.
+ * Used internally for validation — inputParams, outputParams, and execute are checked manually.
+ */
+export const CreateCustomToolBaseSchema = z.object({
+  name: z.string().min(1, 'createCustomTool: name is required'),
+  description: z.string().min(1, 'createCustomTool: description is required'),
+  /**
+   * Composio toolkit slug that this tool extends (inherits auth from).
+   * Must be a valid Composio toolkit slug (e.g. `'gmail'`, `'github'`, `'meta_ads'`).
+   * The backend validates this against the toolkit catalog.
+   * Leave empty for tools that don't need any Composio-managed authentication.
+   */
+  extendsToolkit: z.string().optional(),
+  preload: z
+    .boolean()
+    .optional()
+    .describe(
+      'When true, include this custom tool in session.tools() so it can be called without searching first.'
+    ),
+});
+
+/** Options for creating local tools via `experimental_createTool()`. */
+export type CreateLocalToolParams<T extends AnyZodSchema> = z.infer<
+  typeof CreateCustomToolBaseSchema
+> & {
+  /** Zod schema for input parameters */
+  inputParams: T;
+  /** Optional Zod schema for output parameters (sent to backend for documentation) */
+  outputParams?: AnyZodSchema;
+  /** The function that executes the tool */
+  execute: LocalToolExecuteFn<T>;
+};
+
+/** @deprecated Use `CreateLocalToolParams` instead; local tools were previously called custom tools. */
+export type CreateCustomToolParams<T extends AnyZodSchema> = CreateLocalToolParams<T>;
+
+/**
+ * One of your local tools, returned from `experimental_createTool()`; it runs in your process.
+ * Pass to `composio.create(userId, { experimental: { localTools: [...] } })` to bind to a session.
+ */
+export interface LocalTool {
+  readonly slug: string;
+  readonly name: string;
+  readonly description: string;
+  /**
+   * Composio toolkit slug that this tool extends (inherits auth from).
+   * Must be a valid Composio toolkit slug. Validated by the backend.
+   * Undefined means the tool doesn't need any Composio-managed authentication.
+   */
+  readonly extendsToolkit?: string;
+  /**
+   * Include this custom tool in session.tools() so it can be called without
+   * searching first.
+   */
+  readonly preload?: boolean;
+  readonly inputSchema: Record<string, unknown>;
+  /** JSON Schema representation of the output (for backend documentation) */
+  readonly outputSchema?: Record<string, unknown>;
+  /** @internal Original Zod schema — used for runtime input validation (defaults, coercions, transforms) */
+  readonly inputParams: AnyZodSchema;
+  /** Direct reference to the execute function — useful for testing */
+  readonly execute: LocalToolExecuteFn<AnyZodSchema>;
+}
+
+/** @deprecated Use `LocalTool` instead; local tools were previously called custom tools. */
+export type CustomTool = LocalTool;
+
+/** Serialized tool definition sent to backend for search indexing. Uses official client type. */
+export type CustomToolDefinition = NonNullable<
+  NonNullable<SessionCreateParams['experimental']>['custom_tools']
+>[number];
+
+export type CustomToolWireDefinition = CustomToolDefinition;
+
+// ────────────────────────────────────────────────────────────────
+// Custom toolkit types
+// ────────────────────────────────────────────────────────────────
+
+/**
+ * Zod schema for validating the string/scalar fields of createCustomToolkit() options.
+ * Slug is validated separately as the first argument.
+ */
+export const CreateCustomToolkitBaseSchema = z.object({
+  name: z.string().min(1, 'createCustomToolkit: name is required'),
+  description: z.string().min(1, 'createCustomToolkit: description is required'),
+  preload: z
+    .boolean()
+    .optional()
+    .describe(
+      'When true, include tools from this custom toolkit in session.tools(). Tool-level preload values override this default.'
+    ),
+});
+
+/** Options for grouping local tools into a toolkit via `experimental_createToolkit()`. */
+export type CreateLocalToolkitParams = z.infer<typeof CreateCustomToolkitBaseSchema> & {
+  /** Tools to include in this toolkit. Must not have `extendsToolkit` set. */
+  tools: LocalTool[];
+};
+
+/** @deprecated Use `CreateLocalToolkitParams` instead; local toolkits were previously called custom toolkits. */
+export type CreateCustomToolkitParams = CreateLocalToolkitParams;
+
+/**
+ * A toolkit of local tools returned from `experimental_createToolkit()`.
+ * Pass to `composio.create(userId, { experimental: { localToolkits: [...] } })`.
+ */
+export interface LocalToolkit {
+  readonly slug: string;
+  readonly name: string;
+  readonly description: string;
+  /**
+   * Default session.tools() exposure for tools in this custom toolkit.
+   * Tool-level preload values override this default.
+   */
+  readonly preload?: boolean;
+  readonly tools: readonly LocalTool[];
+}
+
+/** @deprecated Use `LocalToolkit` instead; local toolkits were previously called custom toolkits. */
+export type CustomToolkit = LocalToolkit;
+
+/** Serialized toolkit definition sent to backend. Uses official client type. */
+export type CustomToolkitDefinition = NonNullable<
+  NonNullable<NonNullable<SessionCreateParams['experimental']>['custom_toolkits']>[number]
+>;
+
+export type CustomToolkitWireDefinition = CustomToolkitDefinition;
+
+export interface InlineCustomToolsWirePayload {
+  custom_tools?: CustomToolWireDefinition[];
+  custom_toolkits?: CustomToolkitWireDefinition[];
+}
+
+// ────────────────────────────────────────────────────────────────
+// Internal routing types
+// ────────────────────────────────────────────────────────────────
+
+/** @internal Entry in the per-session custom tools routing map. */
+export type CustomToolsMapEntry = {
+  handle: LocalTool;
+  /** @internal The final slug assigned by the prefixing rules (e.g. LOCAL_GREP, LOCAL_GMAIL_GET_EMAILS) */
+  finalSlug: string;
+  /** Resolved toolkit — from extendsToolkit, parent custom toolkit, or undefined for standalone */
+  toolkit?: string;
+};
+
+/** @internal Lookup maps used by ToolRouterSession for routing custom tools. */
+export type CustomToolsMap = {
+  /** Lookup by final slug (e.g. LOCAL_GET_USER_CONTEXT) — used for agent execution path */
+  byFinalSlug: Map<string, CustomToolsMapEntry>;
+  /** Lookup by unique original slug (e.g. GET_USER_CONTEXT) — used for programmatic session.execute() */
+  byOriginalSlug: Map<string, CustomToolsMapEntry>;
+  /** Lookup by resolved toolkit + original slug — used when multiple custom toolkits reuse tool names */
+  byToolkitAndOriginalSlug?: Map<string, CustomToolsMapEntry>;
+  /** Original slugs that appear in multiple toolkits and cannot be resolved safely without the final slug */
+  ambiguousOriginalSlugs?: Set<string>;
+  /** The original local toolkits passed at session creation — used for session.localToolkits() */
+  toolkits?: LocalToolkit[];
+  /** The original standalone local tools passed at session creation — kept for inline re-injection on later requests. */
+  tools?: LocalTool[];
+};
+
+// ────────────────────────────────────────────────────────────────
+// Registered local tool types (returned by session.localTools())
+// ────────────────────────────────────────────────────────────────
+
+/** One of your local tools as registered in a session, with its final resolved slug. */
+export interface RegisteredLocalTool {
+  /** The final slug as registered with the backend (e.g. LOCAL_GREP, LOCAL_GMAIL_GET_EMAILS) */
+  slug: string;
+  name: string;
+  description: string;
+  /** Resolved toolkit — extendsToolkit value, local toolkit slug, or undefined for standalone */
+  toolkit?: string;
+  inputSchema: Record<string, unknown>;
+  outputSchema?: Record<string, unknown>;
+}
+
+/** A toolkit of local tools as registered in a session, with final slugs on nested tools. */
+export interface RegisteredLocalToolkit {
+  slug: string;
+  name: string;
+  description: string;
+  tools: RegisteredLocalTool[];
+}
+
+/** @deprecated Use `RegisteredLocalTool` instead; local tools were previously called custom tools. */
+export type RegisteredCustomTool = RegisteredLocalTool;
+
+/** @deprecated Use `RegisteredLocalToolkit` instead; local toolkits were previously called custom toolkits. */
+export type RegisteredCustomToolkit = RegisteredLocalToolkit;
+
+// ────────────────────────────────────────────────────────────────
+// Response types from the backend (slug + original_slug mapping)
+// ────────────────────────────────────────────────────────────────
+
+/** Custom tool as returned in the session create response (has prefixed slug + original_slug). */
+export type CustomToolResponse = NonNullable<
+  NonNullable<SessionCreateResponse['experimental']>['custom_tools']
+>[number];
+
+/** Custom toolkit as returned in the session create response (has prefixed slugs + original_slugs). */
+export type CustomToolkitResponse = NonNullable<
+  NonNullable<NonNullable<SessionCreateResponse['experimental']>['custom_toolkits']>[number]
+>;
