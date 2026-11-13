@@ -1,0 +1,24 @@
+import { Effect } from 'effect';
+import { HOST_CONFIG } from 'src/config';
+
+export type MasterKind = 'claude' | 'codex' | 'user';
+
+export type MasterSignals = {
+  readonly codex: boolean;
+  readonly claude: boolean;
+};
+
+export const detectMaster = (signals: MasterSignals): MasterKind => {
+  if (signals.codex) {
+    return 'codex';
+  }
+  if (signals.claude) {
+    return 'claude';
+  }
+  return 'user';
+};
+
+export const detectMasterFromHost: Effect.Effect<MasterKind> = HOST_CONFIG.MASTER_SIGNALS.pipe(
+  Effect.orDie,
+  Effect.map(detectMaster)
+);
